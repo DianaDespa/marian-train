@@ -14,6 +14,7 @@
 #include "training/dropper.h"
 #include "training/scheduler.h"
 #include "training/sparse_tensor.h"
+#include "training/quantized_tensor.h"
 #include "training/training.h"
 #include "training/validator.h"
 
@@ -217,6 +218,8 @@ private:
   std::vector<SparseTensor> sparseGrads_;
   std::vector<SparseTensor> tmpSparseDelta;
   std::vector<std::vector<SparseTensor>> localSparseDelta;
+  std::vector<QuantizedTensor> localQuantizedGrads_;
+  std::vector<QuantizedTensor> quantizedGrads_;
 
   // version number per-shard
   std::vector<int> globalVersionNumber;
@@ -411,6 +414,55 @@ private:
               int pastVersion = globalVersionNumber[idx] % historySize_;
               int latestVersion = ++globalVersionNumber[idx] % historySize_;
               params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
+              shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx]); // inline with toDense()
+
+              if(movingAvg_)
+                updateMovingAverage(paramsAvg_[idx],
+                                    params_[latestVersion][idx],
+                                    scheduler_->numberOfBatches());
+
+              cudaStreamSynchronize(0);
+            },
+            idx,
+            pos));
+
+        pos += shardSize_;
+      }
+      for(auto&& t : threads)
+        t.join();
+    }
+  }
+
+  void sparsePushQuantizedGradients(QuantizedTensor newGrads) {
+    if(graphs_.size() < 2) {
+      opt_->update(graphs_[0]);
+    } else {
+      // add instead of copy?
+      std::vector<std::thread> threads;
+      int pos = 0;
+      for(int idx = 0; idx < devices_.size(); idx++) {
+        threads.emplace_back(std::thread(
+            [=](int idx, int pos) {
+              // individual mutex per-shard
+              std::lock_guard<std::mutex> guard(shardSync_[idx]);
+
+              // split to shard
+              QuantizedTensor subGrad
+                  = newGrads->subtensor(pos, grads_[idx]->size(), idx);
+              cudaStreamSynchronize(0);
+
+              // sent
+              quantizedGrads_[idx]->copyFrom(subGrad);
+              cudaStreamSynchronize(0);
+
+              // convert back to dense, with index offset of -pos // Why?
+              quantizedGrads_[idx]->toDense(grads_[idx], -pos);
+              cudaStreamSynchronize(0);
+
+              // apply and increment your version number
+              int pastVersion = globalVersionNumber[idx] % historySize_;
+              int latestVersion = ++globalVersionNumber[idx] % historySize_;
+              params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
               shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx]);
 
               if(movingAvg_)
@@ -519,17 +571,26 @@ private:
         int totalSize = graphs_[0]->params()->vals()->size();
         int sparseCapacity = totalSize * 1.2 * (1.0 - dropRate_); // why 1.2?
         for(auto device : devices_) {
-          sparseGrads_.push_back(
-              SparseTensor(new SparseTensorBase(sparseCapacity, device)));
-          localSparseGrads_.push_back(
-              SparseTensor(new SparseTensorBase(sparseCapacity, device)));
-          tmpSparseDelta.push_back(SparseTensor(
-              new SparseTensorBase(sparseCapacity / devices_.size(), device)));
-          std::vector<SparseTensor> tmp;
-          for(int i = 0; i < devices_.size(); i++)
-            tmp.push_back(SparseTensor(
+          if (options_->get<bool>("quantize-sparse")) {
+            int bits = options_->get<int>("quantize-bits");
+            int encodingSize = 1<<bits;
+            quantizedGrads_.push_back(
+              QuantizedTensor(new QuantizedTensorBase(encodingSize, sparseCapacity, device)));
+            localQuantizedGrads_.push_back(
+              QuantizedTensor(new QuantizedTensorBase(encodingSize, sparseCapacity, device)));
+          } else {
+            sparseGrads_.push_back(
+                SparseTensor(new SparseTensorBase(sparseCapacity, device)));
+            localSparseGrads_.push_back(
+                SparseTensor(new SparseTensorBase(sparseCapacity, device)));
+            tmpSparseDelta.push_back(SparseTensor(
                 new SparseTensorBase(sparseCapacity / devices_.size(), device)));
-          localSparseDelta.push_back(tmp);
+            std::vector<SparseTensor> tmp;
+            for(int i = 0; i < devices_.size(); i++)
+              tmp.push_back(SparseTensor(
+                  new SparseTensorBase(sparseCapacity / devices_.size(), device)));
+            localSparseDelta.push_back(tmp);
+          }
         }
       }
 
@@ -587,9 +648,15 @@ private:
 
       cudaStreamSynchronize(0);
       if(dropRate_) {
-        dropper->dropGraph(
-            graph->params()->grads(), localSparseGrads_[myId], dropRate_, layerShapes);
-        sparsePushGradients(localSparseGrads_[myId]);
+        if (options_->get<bool>("quantize-sparse")) {
+          dropper->dropGraphQuantized(
+            graph->params()->grads(), localQuantizedGrads_[myId], dropRate_, layerShapes);
+          sparsePushQuantizedGradients(localQuantizedGrads_[myId]);
+        } else {
+          dropper->dropGraph(
+              graph->params()->grads(), localSparseGrads_[myId], dropRate_, layerShapes);
+          sparsePushGradients(localSparseGrads_[myId]);
+        }
       } else
         pushGradients(graph->params()->grads());
 

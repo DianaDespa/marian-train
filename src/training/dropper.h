@@ -11,6 +11,7 @@
 #include "kernels/cuda_helpers.h"
 #include "kernels/tensor_operators.h"
 #include "training/sparse_tensor.h"
+#include "training/quantized_tensor.h"
 
 namespace marian {
 
@@ -211,7 +212,7 @@ private:
 
     gradAddError<<<blocks, threads>>>(data, errors, totalSize);
     // full sort
-    int sortSize = min(100000, totalSize);
+    int sortSize = min(100000, totalSize); // Why?
     int blocksSample = 1 + sortSize / threads;
     randomSampling<<<blocksSample, threads>>>(
         data, tmpData, sortSize, totalSize / sortSize, totalSize);
@@ -278,7 +279,7 @@ public:
   GradientDropBase(Ptr<Config> options) : options_(options) {}
 
   void dropGraph(Tensor sourceTensor, SparseTensor destinationTensor,
-      double dropRate = 0.99, std::vector<std::pair<int,int> > const &layerShapes = {}) {
+      double dropRate = 0.99, std::vector<std::pair<int,int> > layerShapes = {}) {
     float* feedback = NULL;
     float* tmpData;
     int step;
@@ -345,6 +346,76 @@ public:
     cudaStreamSynchronize(0);
 
     step++;
+  }
+
+  void dropGraphQuantized(Tensor sourceTensor, QuantizedTensor destinationTensor,
+      double dropRate = 0.99, std::vector<std::pair<int,int> > layerShapes = {}) {
+    // float* feedback = NULL;
+    // float* tmpData;
+    // int step;
+    // std::vector<std::pair<std::pair<int,int>, int > > layerShapesSizes;
+
+    // cudaSetDevice(sourceTensor->getDevice());    
+    // if(!feedback) {
+    //   device_ = sourceTensor->getDevice();
+    //   cudaMalloc(&feedback, sizeof(float) * sourceTensor->size());
+    //   cudaMalloc(&tmpData, sizeof(float) * sourceTensor->size());
+    //   cudaMemset(feedback, 0, sizeof(float) * sourceTensor->size());
+    //   cudaMemset(tmpData, 0, sizeof(float) * sourceTensor->size());
+
+    //   step = 0;
+
+    //   // Add layer dimentions along with incremental layer sizes to a vector.
+    //   int totalSize = 0;
+    //   for(auto& shape: layerShapes) {
+    //     std::pair<std::pair<int,int>, int > tmpColumnData;
+    //     tmpColumnData.first = shape;
+    //     tmpColumnData.second = totalSize;
+    //     layerShapesSizes.push_back(tmpColumnData);
+    //     totalSize += shape.second * shape.first;    
+    //   }
+    // }
+
+    // // If col-wise drop is disabled OR layer shapes info not provided, drop globally.
+    // if(!options_->get<bool>("quantize-column-wise") || layerShapes.size() == 0) {
+    //   LOG(info)->info("NOT COLUMN WISE");
+    //   gradDropDo(sourceTensor->data(), feedback, tmpData, sourceTensor->size(), 1, dropRate);
+    // } else {
+    //   LOG(info)->info("COLUMN WISE");
+    //   for(auto &shape: layerShapesSizes) {
+    //     int offset = shape.second;
+    //     gradDropDo(sourceTensor->data() + offset, feedback + offset, tmpData + offset,
+    //         shape.first.first, shape.first.second, dropRate);
+    //   }
+    // }
+
+    // // if(dropRate < 0.9)
+    //     // return;
+
+    // thrust::device_ptr<float> maskPtr(tmpData);
+    // int denseSize = sourceTensor->size();
+    // thrust::inclusive_scan(maskPtr, maskPtr + denseSize, maskPtr);
+    // float sparseSize;
+
+    // cudaMemcpy(&sparseSize,
+    //            tmpData + denseSize - 1,
+    //            sizeof(float),
+    //            cudaMemcpyDeviceToHost);
+
+    // // Convert result of inclusive scan to indices.
+    // int threads = 512;
+    // int blocks = 1 + denseSize / threads;
+    // cudaSetDevice(sourceTensor->getDevice());
+    // buildIndices<<<blocks, threads>>>(sourceTensor->data(),
+    //                                   tmpData,
+    //                                   destinationTensor->data(),
+    //                                   destinationTensor->indices(),
+    //                                   denseSize);
+    // destinationTensor->setSize(sparseSize);
+
+    // cudaStreamSynchronize(0);
+
+    // step++;
   }
 };
 

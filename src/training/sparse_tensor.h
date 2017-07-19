@@ -140,15 +140,15 @@ public:
 
     int threads = 512;
     int blocks = 1 + size_ / threads;
-    cudaMemset(start, -1, sizeof(int));
-    cudaMemset(end, 0, sizeof(int));
+    cudaMemset(start, -1, sizeof(int)); // why?
+    cudaMemset(end, 0, sizeof(int)); // why?
 
     gFindSubtensor<<<blocks, threads>>>(
         indices_, size_, pos, pos + size, start, end);
 
     int startOffset;
     int endOffset;
-    int tmp_dt;
+    int tmp_dt; // why? 
     cudaMemcpy(&startOffset, start, sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&endOffset, end, sizeof(int), cudaMemcpyDeviceToHost);
 

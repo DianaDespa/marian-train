@@ -404,6 +404,8 @@ void ConfigParser::addOptionsQuantize(po::options_description& desc) {
                                 guess_terminal_width());
   // clang-format off
   quantize.add_options()
+    ("quantize-sparse", po::value<bool>()->zero_tokens()->default_value(false),
+      "Only send out sparse gradients.")
     ("quantize-bits", po::value<int>()->default_value(32),
       "Number of bits to use for encoding.")
     ("quantize-column-wise", po::value<bool>()->zero_tokens()->default_value(false),
