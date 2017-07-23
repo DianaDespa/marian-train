@@ -389,6 +389,22 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
   desc.add(training);
 }
 
+void ConfigParser::addOptionsQuantize(po::options_description& desc) {
+  po::options_description quantize("Sparse matrix encoding and quantize options",
+                                guess_terminal_width());
+  // clang-format off
+  quantize.add_options()
+    ("quantize-bits", po::value<int>()->default_value(32),
+      "Number of bits to use for encoding.")
+    ("quantize-column-wise", po::value<bool>()->zero_tokens()->default_value(false),
+      "Enable column-wise dropping for quantization.")
+    ("quantize-min-drop", po::value<bool>()->zero_tokens()->default_value(false),
+      "Use min as the quantization center, default (false) uses mean.")
+  ;
+  // clang-format on
+  desc.add(quantize);
+}
+
 void ConfigParser::addOptionsValid(po::options_description& desc) {
   po::options_description valid("Validation set options",
                                 guess_terminal_width());
@@ -425,22 +441,6 @@ void ConfigParser::addOptionsValid(po::options_description& desc) {
   ;
   // clang-format on
   desc.add(valid);
-}
-
-void ConfigParser::addOptionsQuantize(po::options_description& desc) {
-  po::options_description quantize("Sparse matrix encoding and quantize options",
-                                guess_terminal_width());
-  // clang-format off
-  quantize.add_options()
-    ("quantize-bits", po::value<int>()->default_value(32),
-      "Number of bits to use for encoding.")
-    ("quantize-column-wise", po::value<bool>()->zero_tokens()->default_value(false),
-      "Enable column-wise dropping for quantization.")
-    ("quantize-min-drop", po::value<bool>()->zero_tokens()->default_value(false),
-      "Use min as the quantization center, default (false) uses mean.")
-  ;
-  // clang-format on
-  desc.add(quantize);
 }
 
 void ConfigParser::addOptionsTranslate(po::options_description& desc) {

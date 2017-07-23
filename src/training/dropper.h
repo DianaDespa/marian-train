@@ -5,7 +5,6 @@
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 #include <memory>
-#include <cfloat>
 
 #include "common/definitions.h"
 #include "kernels/cuda_helpers.h"
@@ -67,22 +66,23 @@ __global__ void columnWiseQuantize(float* input, float* tmpData, float* error,
     if(threadIdx.x < offset) {
       sdata[threadIdx.x] += sdata[threadIdx.x + offset];
       scount[threadIdx.x] += scount[threadIdx.x + offset];
-      
+
       if(smin[threadIdx.x] > smin[threadIdx.x + offset])
         smin[threadIdx.x] = smin[threadIdx.x + offset];
     }
     __syncthreads();
   }
-  
+
   if(scount[0] == 0)
     return;
-  
+
   if(useMinDrop)
     perBlockResults = smin[0];
   else
     perBlockResults = sdata[0] / (float) scount[0];
 
   __syncthreads();
+
   // Min/average is obtained. Now replace all:
   for(int i = threadIdx.x; i < rowSize; i += blockDim.x) {
     if(std::abs(columnData[i]) <= minVal) {
@@ -108,7 +108,7 @@ __global__ void gradDropQuantize(float* data, float* tmpData, float* errors,
     data[idx] = 0;
     tmpData[idx] = 0;
   } else {
-    int sign = (data[idx] < 0) ? -1 : 1; 
+    int sign = (data[idx] < 0) ? -1 : 1;
     int bucketId = (int)((std::abs(data[idx]) - minVal) / bucketVal);
     if(bucketId > maxBucketId)
       bucketId = maxBucketId;
@@ -130,7 +130,7 @@ __global__ void gradDropQuantizeMean(float* data, float* tmpData, float* errors,
     data[idx] = 0;
     tmpData[idx] = 0;
   } else {
-    int sign = (data[idx] < 0) ? -1 : 1; 
+    int sign = (data[idx] < 0) ? -1 : 1;
     int bucketId = (int)((std::abs(data[idx]) - minVal) / bucketVal);
     if(bucketId > maxBucketId)
       bucketId = maxBucketId;
@@ -193,7 +193,9 @@ __global__ void locate(float* data, float toLocate, int size, int* result) {
 class GradientDropBase {
 private:
   Ptr<Config> options_;
-  int device_;
+  float* feedback = NULL;
+  float* tmpData;
+  int step;
 
   // A helper, returns i-th element from a GPU stored array.
   float get(float* data, int i) {
@@ -202,12 +204,12 @@ private:
     return res;
   }
 
-  void gradDropDo(
-      float* data, float* errors, float* tmpData, int rowSize, int colSize, float dropRate) {
+  void gradDropDo(int device,
+      float* data, float* errors, float* tmpData, int rowSize, int colSize, float rate) {
     int totalSize = rowSize * colSize;
     int threads = 512;
     int blocks = 1 + totalSize / threads;
-    cudaSetDevice(device_);
+    CUDA_CHECK(cudaSetDevice(device));
 
     gradAddError<<<blocks, threads>>>(data, errors, totalSize);
     // full sort
@@ -216,10 +218,13 @@ private:
     randomSampling<<<blocksSample, threads>>>(
         data, tmpData, sortSize, totalSize / sortSize, totalSize);
     thrust::device_ptr<float> tmpDataPtr(tmpData);
-    thrust::sort(tmpDataPtr, tmpDataPtr + sortSize);
+    try {
+      thrust::sort(tmpDataPtr, tmpDataPtr + sortSize);
+    } catch(thrust::system_error &e) {
+      LOG(warn)->warn("Sort error {}", e.what());
+    }
 
-    // dont update the cut threshold every step
-    int cutOffIndex = std::max(0, (int)(sortSize * dropRate) - 1);
+    int cutOffIndex = std::max(0, (int)(sortSize * rate) - 1);
     float cutOffValue = get(tmpData, cutOffIndex);
 
     int bits = options_->get<int>("quantize-bits");
@@ -228,7 +233,7 @@ private:
       return;
     }
 
-    // bits--;
+    bits--;
     long long bucketCount = (1<<bits);
     float minVal = cutOffValue, maxVal = get(tmpData, sortSize - 1);
     float range = maxVal - minVal;
@@ -237,39 +242,37 @@ private:
     float mean2;
 
     if(options_->get<bool>("quantize-column-wise") && colSize != 1) {
-      if (step == 0)
-        LOG(info)->info("COLUMN WISE...");
-      // Each column gets assigned to one block.  
+      // Each column gets assigned to one block.
       columnWiseQuantize<<<colSize, threads>>>(data, tmpData, errors, minVal,
           rowSize, totalSize, options_->get<bool>("quantize-min-drop"));
       return;
     }
 
     if(options_->get<bool>("quantize-min-drop")) {
-      if (step == 0)
-        LOG(info)->info("MIN DROP...");
       gradDropQuantize<<<blocks, threads>>>(data, tmpData, errors, minVal,
           bucketVal, bucketCount - 1, totalSize);
       return;
     }
 
-    LOG(info)->info("AVG DROP...");
-
     int* result;
     int idx;
     cudaMalloc(&result, sizeof(int));
     locate<<<blocks, threads>>>(tmpData, minVal + bucketVal, sortSize, result);
-    cudaMemcpy(&idx, result, sizeof(int), cudaMemcpyDeviceToHost); 
+    cudaMemcpy(&idx, result, sizeof(int), cudaMemcpyDeviceToHost);
     idx++;
-    if(idx > cutOffIndex && idx <= sortSize)
-      mean1 = thrust::reduce(tmpDataPtr + cutOffIndex, tmpDataPtr + idx)
-          / (idx - cutOffIndex);
-    if(idx > cutOffIndex && idx < sortSize)
-      mean2 = thrust::reduce(tmpDataPtr + idx, tmpDataPtr + sortSize)
-          / (sortSize - idx);
-    
+    try {
+      if(idx > cutOffIndex && idx <= sortSize)
+        mean1 = thrust::reduce(tmpDataPtr + cutOffIndex, tmpDataPtr + idx)
+            / (idx - cutOffIndex);
+      if(idx > cutOffIndex && idx < sortSize)
+        mean2 = thrust::reduce(tmpDataPtr + idx, tmpDataPtr + sortSize)
+            / (sortSize - idx);
+    } catch(thrust::system_error &e) {
+      LOG(warn)->warn("Reduce error {}", e.what());
+    }
+
     cudaFree(result);
-    
+
     gradDropQuantizeMean<<<blocks, threads>>>(data, tmpData, errors, minVal,
         bucketVal, bucketCount - 1, mean1, mean2, totalSize);
   }
@@ -277,16 +280,12 @@ private:
 public:
   GradientDropBase(Ptr<Config> options) : options_(options) {}
 
-  void dropGraph(Tensor sourceTensor, SparseTensor destinationTensor,
-      double dropRate = 0.99, std::vector<std::pair<int,int> > const &layerShapes = {}) {
-    float* feedback = NULL;
-    float* tmpData;
-    int step;
+  void dropGraph(Tensor sourceTensor, SparseTensor destinationTensor, double rate = 0.99,
+      std::vector<std::pair<int,int> > const &layerShapes = {}) {
     std::vector<std::pair<std::pair<int,int>, int > > layerShapesSizes;
 
-    cudaSetDevice(sourceTensor->getDevice());    
+    CUDA_CHECK(cudaSetDevice(sourceTensor->getDevice()));
     if(!feedback) {
-      device_ = sourceTensor->getDevice();
       CUDA_CHECK(cudaMalloc(&feedback, sizeof(float) * sourceTensor->size()));
       CUDA_CHECK(cudaMalloc(&tmpData, sizeof(float) * sourceTensor->size()));
       cudaMemset(feedback, 0, sizeof(float) * sourceTensor->size());
@@ -301,29 +300,31 @@ public:
         tmpColumnData.first = shape;
         tmpColumnData.second = totalSize;
         layerShapesSizes.push_back(tmpColumnData);
-        totalSize += shape.second * shape.first;    
+        totalSize += shape.second * shape.first;
       }
     }
 
     // If col-wise drop is disabled OR layer shapes info not provided, drop globally.
     if(!options_->get<bool>("quantize-column-wise") || layerShapes.size() == 0) {
-      LOG(info)->info("NOT COLUMN WISE");
-      gradDropDo(sourceTensor->data(), feedback, tmpData, sourceTensor->size(), 1, dropRate);
+      gradDropDo(sourceTensor->getDevice(), sourceTensor->data(), feedback, tmpData, sourceTensor->size(), 1, rate);
     } else {
-      LOG(info)->info("COLUMN WISE");
       for(auto &shape: layerShapesSizes) {
         int offset = shape.second;
-        gradDropDo(sourceTensor->data() + offset, feedback + offset, tmpData + offset,
-            shape.first.first, shape.first.second, dropRate);
+        gradDropDo(sourceTensor->getDevice(), sourceTensor->data() + offset, feedback + offset, tmpData + offset,
+            shape.first.first, shape.first.second, rate);
       }
     }
 
-    // if(dropRate < 0.9)
+    // if(rate < 0.9)
         // return;
 
     thrust::device_ptr<float> maskPtr(tmpData);
     int denseSize = sourceTensor->size();
-    thrust::inclusive_scan(maskPtr, maskPtr + denseSize, maskPtr);
+    try {
+      thrust::inclusive_scan(maskPtr, maskPtr + denseSize, maskPtr);
+    } catch(thrust::system_error &e) {
+      LOG(warn)->warn("Inclusive scan error {}", e.what());
+    }
     float sparseSize;
 
     cudaMemcpy(&sparseSize,
@@ -334,7 +335,7 @@ public:
     // Convert result of inclusive scan to indices.
     int threads = 512;
     int blocks = 1 + denseSize / threads;
-    cudaSetDevice(sourceTensor->getDevice());
+    CUDA_CHECK(cudaSetDevice(sourceTensor->getDevice()));
     buildIndices<<<blocks, threads>>>(sourceTensor->data(),
                                       tmpData,
                                       destinationTensor->data(),
