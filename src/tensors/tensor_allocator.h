@@ -5,6 +5,7 @@
 
 #include "common/definitions.h"
 #include "tensors/tensor.h"
+#include "tensors/quantized_tensor.h"
 #include "tensors/allocator.h"
 #include "tensors/device_gpu.h"
 
@@ -64,6 +65,14 @@ public:
       int size = shape.elements();
       auto mem = allocator_->alloc<float>(size);
       t = Tensor(new TensorBase(mem, shape, allocator_->getDevice()));
+    }
+  }
+
+  void allocate(QuantizedTensor& t, Shape shape, int bits) {
+    if(!t || t->shape() != shape) {
+      int size = shape.elements();
+      auto mem = allocator_->alloc<float>(size);
+      t = QuantizedTensor(new QuantizedTensorBase(mem, shape, allocator_->getDevice(), bits));
     }
   }
 
