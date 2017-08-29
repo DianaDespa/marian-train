@@ -13,6 +13,9 @@ cuda_add_library(marian
   graph/node_operators.cu
   tensors/tensor.cu
   tensors/device_gpu.cu
+  quantization/quantized_tensor.cu
+  quantization/quantized_tensor_32_bit_indices.cu
+  quantization/quantized_tensor_32_bit_compressed.cu
   kernels/tensor_operators.cu
   kernels/dropout.cu
   kernels/sparse.cu

@@ -394,12 +394,17 @@ void ConfigParser::addOptionsQuantize(po::options_description& desc) {
                                 guess_terminal_width());
   // clang-format off
   quantize.add_options()
+    ("quantize-variant", po::value<int>()->default_value(0),
+      "0 - use simulated quantization, i.e. send sparse indices together with data \
+       1 - use 32 bit indices \
+       2 - use 32 bit compressed indices together with encoded values \
+       Variants 1-4 use 2-bit min-drop quantization.")
     ("quantize-bits", po::value<int>()->default_value(32),
-      "Number of bits to use for encoding.")
+      "Number of bits to use for encoding. Only works with variant 0.")
     ("quantize-column-wise", po::value<bool>()->zero_tokens()->default_value(false),
-      "Enable column-wise dropping for quantization.")
+      "Enable column-wise dropping for quantization. Only works with variant 0.")
     ("quantize-min-drop", po::value<bool>()->zero_tokens()->default_value(false),
-      "Use min as the quantization center, default (false) uses mean.")
+      "Use min as the quantization center, default (false) uses mean. Only works with variant 0.")
   ;
   // clang-format on
   desc.add(quantize);
@@ -655,6 +660,7 @@ void ConfigParser::parseOptions(
     SET_OPTION("quantize-bits", int);
     SET_OPTION("quantize-column-wise", bool);
     SET_OPTION("quantize-min-drop", bool);
+    SET_OPTION("quantize-variant", int);
 
     SET_OPTION_NONDEFAULT("embedding-vectors", std::vector<std::string>);
     SET_OPTION("embedding-normalization", bool);

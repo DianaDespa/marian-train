@@ -5,6 +5,7 @@
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 #include <memory>
+#include <cfloat>
 
 #include "common/definitions.h"
 #include "kernels/cuda_helpers.h"
@@ -174,14 +175,6 @@ __global__ void buildIndices(float* denseData,
   }
 }
 
-__global__ void randomSampling(
-    float* originalData, float* data, int size, int scale, int fullSize) {
-  int idx = blockDim.x * blockIdx.x + threadIdx.x;
-  if(idx >= size)
-    return;
-  data[idx] = abs(originalData[idx * scale]);
-}
-
 __global__ void locate(float* data, float toLocate, int size, int* result) {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
   if(idx >= size)
@@ -190,12 +183,23 @@ __global__ void locate(float* data, float toLocate, int size, int* result) {
     *result = idx;
 }
 
+__global__ void randomSampling(
+    float* originalData, float* data, int size, int scale) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if(idx >= size)
+    return;
+  data[idx] = abs(originalData[idx * scale]);
+}
+
 class GradientDropBase {
 private:
-  Ptr<Config> options_;
   float* feedback = NULL;
   float* tmpData;
   int step;
+  int device_;
+  int bits_;
+  bool minDrop_;
+  bool columnWise_;
 
   // A helper, returns i-th element from a GPU stored array.
   float get(float* data, int i) {
@@ -204,30 +208,25 @@ private:
     return res;
   }
 
-  void gradDropDo(int device,
-      float* data, float* errors, float* tmpData, int rowSize, int colSize, float rate) {
+  void dropDo(float* data, float* errors, float* tmpData, int rowSize, int colSize, float rate) {
     int totalSize = rowSize * colSize;
     int threads = 512;
     int blocks = 1 + totalSize / threads;
-    CUDA_CHECK(cudaSetDevice(device));
+    cudaSetDevice(device_);
 
     gradAddError<<<blocks, threads>>>(data, errors, totalSize);
     // full sort
-    int sortSize = min(100000, totalSize); // Why?
+    int sortSize = min(100000, totalSize);
     int blocksSample = 1 + sortSize / threads;
     randomSampling<<<blocksSample, threads>>>(
-        data, tmpData, sortSize, totalSize / sortSize, totalSize);
+        data, tmpData, sortSize, totalSize / sortSize);
     thrust::device_ptr<float> tmpDataPtr(tmpData);
-    try {
-      thrust::sort(tmpDataPtr, tmpDataPtr + sortSize);
-    } catch(thrust::system_error &e) {
-      LOG(warn)->warn("Sort error {}", e.what());
-    }
+    thrust::sort(tmpDataPtr, tmpDataPtr + sortSize);
 
     int cutOffIndex = std::max(0, (int)(sortSize * rate) - 1);
     float cutOffValue = get(tmpData, cutOffIndex);
 
-    int bits = options_->get<int>("quantize-bits");
+    int bits = bits_;
     if(bits == 32) {
       gradDrop<<<blocks, threads>>>(data, tmpData, errors, cutOffValue, totalSize);
       return;
@@ -241,14 +240,14 @@ private:
     float mean1;
     float mean2;
 
-    if(options_->get<bool>("quantize-column-wise") && colSize != 1) {
+    if(columnWise_ && colSize != 1) {
       // Each column gets assigned to one block.
       columnWiseQuantize<<<colSize, threads>>>(data, tmpData, errors, minVal,
-          rowSize, totalSize, options_->get<bool>("quantize-min-drop"));
+          rowSize, totalSize, minDrop_);
       return;
     }
 
-    if(options_->get<bool>("quantize-min-drop")) {
+    if(minDrop_) {
       gradDropQuantize<<<blocks, threads>>>(data, tmpData, errors, minVal,
           bucketVal, bucketCount - 1, totalSize);
       return;
@@ -278,14 +277,29 @@ private:
   }
 
 public:
-  GradientDropBase(Ptr<Config> options) : options_(options) {}
+  struct is_non_zero
+  {
+    __host__ __device__
+    bool operator()(float x)
+    {
+      return x != 0;
+    }
+  };
+
+  GradientDropBase() : GradientDropBase(32, false, false) {}
+
+  GradientDropBase(int bits, bool minDrop, bool columnWise)
+      : bits_(bits),
+        minDrop_(minDrop),
+        columnWise_(columnWise) {}
 
   void dropGraph(Tensor sourceTensor, SparseTensor destinationTensor, double rate = 0.99,
       std::vector<std::pair<int,int> > const &layerShapes = {}) {
     std::vector<std::pair<std::pair<int,int>, int > > layerShapesSizes;
 
-    CUDA_CHECK(cudaSetDevice(sourceTensor->getDevice()));
+    cudaSetDevice(sourceTensor->getDevice());
     if(!feedback) {
+      device_ = sourceTensor->getDevice();
       CUDA_CHECK(cudaMalloc(&feedback, sizeof(float) * sourceTensor->size()));
       CUDA_CHECK(cudaMalloc(&tmpData, sizeof(float) * sourceTensor->size()));
       cudaMemset(feedback, 0, sizeof(float) * sourceTensor->size());
@@ -304,27 +318,25 @@ public:
       }
     }
 
+    // drop the gradients/params in sourceTensor->data(). Also fills in feedback with the propagated error
+    // fills tmpData with binary flag. 0 means that gradient in that position is dropped, 1 otherwise
+    
     // If col-wise drop is disabled OR layer shapes info not provided, drop globally.
-    if(!options_->get<bool>("quantize-column-wise") || layerShapes.size() == 0) {
-      gradDropDo(sourceTensor->getDevice(), sourceTensor->data(), feedback, tmpData, sourceTensor->size(), 1, rate);
+    if(!columnWise_ || layerShapes.size() == 0) {
+      dropDo(sourceTensor->data(), feedback, tmpData, sourceTensor->size(), 1, rate);
     } else {
       for(auto &shape: layerShapesSizes) {
         int offset = shape.second;
-        gradDropDo(sourceTensor->getDevice(), sourceTensor->data() + offset, feedback + offset, tmpData + offset,
+        dropDo(sourceTensor->data() + offset, feedback + offset, tmpData + offset,
             shape.first.first, shape.first.second, rate);
       }
     }
 
-    // if(rate < 0.9)
-        // return;
-
     thrust::device_ptr<float> maskPtr(tmpData);
     int denseSize = sourceTensor->size();
-    try {
-      thrust::inclusive_scan(maskPtr, maskPtr + denseSize, maskPtr);
-    } catch(thrust::system_error &e) {
-      LOG(warn)->warn("Inclusive scan error {}", e.what());
-    }
+
+    //do inclusive sum on temp_d, to obtain the sparse matrix location of non-dropped gradients
+    thrust::inclusive_scan(maskPtr, maskPtr + denseSize, maskPtr);
     float sparseSize;
 
     cudaMemcpy(&sparseSize,
@@ -335,7 +347,7 @@ public:
     // Convert result of inclusive scan to indices.
     int threads = 512;
     int blocks = 1 + denseSize / threads;
-    CUDA_CHECK(cudaSetDevice(sourceTensor->getDevice()));
+    cudaSetDevice(sourceTensor->getDevice());
     buildIndices<<<blocks, threads>>>(sourceTensor->data(),
                                       tmpData,
                                       destinationTensor->data(),
@@ -347,6 +359,7 @@ public:
 
     step++;
   }
+
 };
 
 typedef Ptr<GradientDropBase> GradientDrop;

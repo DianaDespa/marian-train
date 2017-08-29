@@ -1,0 +1,29 @@
+Added command line parameters:
+* "quantize-variant":
+      0 - use simulated quantization, i.e. send sparse indices together with data
+      1 - use 32 bit indices
+      2 - use 32 bit compressed indices together with encoded values
+      Variants 1-4 use 2-bit min-drop quantization.
+* "quantize-bits":
+      Number of bits to use for encoding. Only works with variant 0.
+* "quantize-column-wise":
+      Enable column-wise dropping for quantization. Only works with variant 0.
+* "quantize-min-drop":
+      Use min as the quantization center, default (false) uses mean. Only works with variant 0.
+
+Quantize variant 0 is Alham's code.
+Quantize variant 1 uses a custom implementation of tensors that hold the quantization centers and
+their corresponding indices sorted in 4 sections of the same GPU array (section 1 is for the first
+center, section 2 is for the negated first quantization center, section 3 is for the second
+quantization center and section 4 is for the negated second quantization center). We keep track of
+where each section starts and the size of each section. When computing the subtensor, the start
+"pointers" move in each section and the sizes adjust according to the start offset and end offset.
+
+Quantize variant 1 uses a custom implementation of tensors that hold the quantization centers and
+their corresponding indices compressed together with the encoded center (first 2 bits are for the
+center encoding, the remaining 30 are for the actual index). The first bits for a 2 bit encoding:
+  * 00 corresponds to the first/larger center
+  * 01 corresponds to the second/smaller center
+  * 10 corresponds to the negated first/larger center
+  * 11 corresponds to the negated second/smaller center
+In this variant, the indices are sorted accross the whole array.

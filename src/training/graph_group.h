@@ -16,6 +16,9 @@
 #include "training/sparse_tensor.h"
 #include "training/training.h"
 #include "training/validator.h"
+#include "quantization/quantized_tensor.h"
+#include "quantization/quantized_tensor_32_bit_indices.h"
+#include "quantization/quantized_tensor_32_bit_compressed.h"
 
 namespace marian {
 
@@ -118,7 +121,7 @@ private:
       /*if(mvAvg_) {
         size_t injectFreq = options_->get<size_t>("moving-inject-freq");
         if(injectFreq && scheduler_->numberOfBatches() % injectFreq == 0) {
-          LOG(info)->info("{} : Injecting moving average into training parameters",
+          // LOG(info)->info("{} : Injecting moving average into training parameters",
                           scheduler_->numberOfBatches());
           graph_->params()->vals()->copyFrom(mvAvgGraph_->params()->vals());
         }
@@ -227,6 +230,11 @@ private:
   std::vector<SparseTensor> tmpSparseDelta;
   std::vector<std::vector<SparseTensor>> localSparseDelta;
 
+  std::vector<QuantizedTensor> localQuantizedGrads_;
+  std::vector<QuantizedTensor> quantizedGrads_;
+  std::vector<QuantizedTensor> tmpQuantizedDelta;
+  std::vector<std::vector<QuantizedTensor>> localQuantizedDelta;
+
   // version number per-shard
   std::vector<int> globalVersionNumber;
 
@@ -237,17 +245,15 @@ private:
   std::vector<Tensor> tmpTensor;
 
   std::vector<std::vector<Tensor>> params_;
-  std::vector<Ptr<TensorAllocator>> paramsAlloc_;
 
   std::vector<Tensor> grads_;
-  std::vector<Ptr<TensorAllocator>> gradsAlloc_;
 
   std::vector<Ptr<OptimizerBase>> shardOpt_;
 
   int shardSize_;
 
   std::vector<Tensor> paramsAvg_;
-  std::vector<Ptr<TensorAllocator>> paramsAllocAvg_;
+
   bool movingAvg_{false};
   float mvDecay_{0.9999};
 
@@ -258,16 +264,55 @@ private:
 
   size_t tau_{1};
 
-  std::vector<Ptr<TensorAllocator>> allocators;
+  int quantizationVariant_;
+  static const int QUANTIZATION_SIMULATED{0};
+  static const int QUANTIZATION_32_BIT_INDICES{1};
+  static const int QUANTIZATION_32_BIT_COMPRESSED{2};
+
+  std::vector<Ptr<TensorAllocator>> allocators_;
 
   Tensor newTensor(int size, int device) {
     Tensor t;
-    Ptr<TensorAllocator> allocator_ = New<TensorAllocator>(device);
-    allocator_->reserveExact(size * sizeof(float));
-    allocator_->allocate(t, {1, size});
-    allocators.push_back(allocator_);
+    Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
+    allocator->reserveExact(size * sizeof(float));
+    allocator->allocate(t, {1, size});
+    allocators_.push_back(allocator);
 
     return t;
+  }
+
+  void initQuantizedVars(int sparseCapacity) {
+    if(quantizationVariant_ == QUANTIZATION_32_BIT_INDICES) {
+
+      for(auto device : devices_) {
+        quantizedGrads_.push_back(
+            QuantizedTensor(new QuantizedTensor32BitIndices(device)));
+        localQuantizedGrads_.push_back(
+            QuantizedTensor(new QuantizedTensor32BitIndices(device)));
+        tmpQuantizedDelta.push_back(QuantizedTensor(
+            new QuantizedTensor32BitIndices(device)));
+        std::vector<QuantizedTensor> tmp;
+        for(int i = 0; i < devices_.size(); i++)
+          tmp.push_back(QuantizedTensor(
+              new QuantizedTensor32BitIndices(device)));
+        localQuantizedDelta.push_back(tmp);
+      }
+    } else if(quantizationVariant_ == QUANTIZATION_32_BIT_COMPRESSED) {
+
+      for(auto device : devices_) {
+        quantizedGrads_.push_back(
+            QuantizedTensor(new QuantizedTensor32BitCompressed(sparseCapacity, device)));
+        localQuantizedGrads_.push_back(
+            QuantizedTensor(new QuantizedTensor32BitCompressed(sparseCapacity, device)));
+        tmpQuantizedDelta.push_back(QuantizedTensor(
+            new QuantizedTensor32BitCompressed(sparseCapacity / devices_.size(), device)));
+        std::vector<QuantizedTensor> tmp;
+        for(int i = 0; i < devices_.size(); i++)
+          tmp.push_back(QuantizedTensor(
+              new QuantizedTensor32BitCompressed(sparseCapacity / devices_.size(), device)));
+        localQuantizedDelta.push_back(tmp);
+      }
+    }
   }
 
   void fetchParams(Tensor oldParams, const std::vector<Tensor>& params) {
@@ -323,8 +368,6 @@ private:
             if(movingAvg_)
               updateMovingAverage(paramsAvg_[idx], params_[latestVersion][idx],
                                   scheduler_->numberOfBatches());
-
-            cudaStreamSynchronize(0);
           },
           idx,
           pos));
@@ -335,7 +378,7 @@ private:
       t.join();
   }
 
-  void sparseFetchParams(Tensor oldParams, int worker_id) {
+  void sparseFetchParams(Tensor oldParams, int workerId) {
     if(graphs_.size() < 2)
       return;
 
@@ -351,16 +394,16 @@ private:
             // obtain the delta
             int latestVersion = globalVersionNumber[idx] % historySize_;
             int currVersion
-                = localVersionNumbers[worker_id][idx] % historySize_;
+                = localVersionNumbers[workerId][idx] % historySize_;
 
             // check if the current version is too old
-            if(globalVersionNumber[idx] - localVersionNumbers[worker_id][idx]
+            if(globalVersionNumber[idx] - localVersionNumbers[workerId][idx]
                >= historySize_)
               currVersion = (1 + globalVersionNumber[idx])
                             % historySize_;  // if so, pick the best you can do
 
             // if already latest
-            if(globalVersionNumber[idx] == localVersionNumbers[worker_id][idx])
+            if(globalVersionNumber[idx] == localVersionNumbers[workerId][idx])
               return;
 
             // get delta : param latest version - current param (locally)
@@ -368,22 +411,18 @@ private:
                     tmpTensor[idx],
                     params_[latestVersion][idx],
                     params_[currVersion][idx]);
-            cudaStreamSynchronize(0);
 
             // get sparse delta
-            fetchDropper[worker_id][idx]->dropGraph(tmpTensor[idx], tmpSparseDelta[idx], dropRate_);
-            cudaStreamSynchronize(0);
+            fetchDropper[workerId][idx]->dropGraph(
+                tmpTensor[idx], tmpSparseDelta[idx], dropRate_);
 
             // move sparse delta
-            localSparseDelta[worker_id][idx]->copyFrom(tmpSparseDelta[idx]);
-            cudaStreamSynchronize(0);
+            localSparseDelta[workerId][idx]->copyFrom(tmpSparseDelta[idx]);
 
-            localSparseDelta[worker_id][idx]->scatterAdd(
+            localSparseDelta[workerId][idx]->scatterAdd(
                 oldParams->subtensor(pos, grads_[idx]->size()));
-            cudaStreamSynchronize(0);
 
-            localVersionNumbers[worker_id][idx] = globalVersionNumber[idx];
-
+            localVersionNumbers[workerId][idx] = globalVersionNumber[idx];
           },
           i,
           p));
@@ -412,24 +451,16 @@ private:
               // individual mutex per-shard
               std::lock_guard<std::mutex> guard(shardSync_[idx]);
 
-              // split to shard
-              SparseTensor subGrad
-                  = newGrads->subtensor(pos, grads_[idx]->size(), idx);
-              cudaStreamSynchronize(0);
+              // send shard
+              sparseGrads_[idx]->copyFrom(newGrads->subtensor(pos, grads_[idx]->size(), idx));
 
-              // sent
-              sparseGrads_[idx]->copyFrom(subGrad);
-              cudaStreamSynchronize(0);
-
-              // convert back to dense, with index offset of -pos // Why?
+              // convert back to dense, with index offset of -pos
               sparseGrads_[idx]->toDense(grads_[idx], -pos);
-              cudaStreamSynchronize(0);
 
               // apply and increment your version number
               int pastVersion = globalVersionNumber[idx] % historySize_;
               int latestVersion = ++globalVersionNumber[idx] % historySize_;
               params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
-
               if (scaleLR) {
                 shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx], batchWords/averageBatchWords);
               } else {
@@ -441,7 +472,112 @@ private:
                                     params_[latestVersion][idx],
                                     scheduler_->numberOfBatches());
 
-              cudaStreamSynchronize(0);
+            },
+            idx,
+            pos));
+
+        pos += shardSize_;
+      }
+      for(auto&& t : threads)
+        t.join();
+    }
+  }
+
+  void quantizedFetchParams(Tensor oldParams, int workerId) {
+    // LOG(info)->info("Fetch");
+    if(graphs_.size() < 2)
+      return;
+
+    // @TODO read guard on parameters
+    int p = 0;
+
+    std::vector<std::thread> threads;
+    for(int i = 0; i < devices_.size(); i++) {
+      threads.emplace_back(std::thread(
+          [=](int idx, int pos) {
+            // individual mutex per-shard
+            std::lock_guard<std::mutex> guard(shardSync_[idx]);
+            // obtain the delta
+            int latestVersion = globalVersionNumber[idx] % historySize_;
+            int currVersion
+                = localVersionNumbers[workerId][idx] % historySize_;
+
+            // check if the current version is too old
+            if(globalVersionNumber[idx] - localVersionNumbers[workerId][idx]
+               >= historySize_)
+              currVersion = (1 + globalVersionNumber[idx])
+                            % historySize_;  // if so, pick the best you can do
+
+            // if already latest
+            if(globalVersionNumber[idx] == localVersionNumbers[workerId][idx])
+              return;
+
+            // get delta : param latest version - current param (locally)
+            Element(_1 = _2 - _3,
+                    tmpTensor[idx],
+                    params_[latestVersion][idx],
+                    params_[currVersion][idx]);
+
+            // get sparse delta
+            tmpQuantizedDelta[idx]->encode(tmpTensor[idx]);
+
+            // move sparse delta
+            localQuantizedDelta[workerId][idx]->copyFrom(tmpQuantizedDelta[idx]);
+
+            localQuantizedDelta[workerId][idx]->scatterAdd(
+                oldParams->subtensor(pos, grads_[idx]->size()));
+
+          },
+          i,
+          p));
+
+      p += shardSize_;
+    }
+    for(auto&& t : threads) {
+      t.join();
+    }
+  }
+
+  void quantizedPushGradients(QuantizedTensor newGrads, size_t batchWords) {
+    // LOG(info)->info("Push");    
+    if(graphs_.size() < 2) {
+      if (scaleLR) {
+        opt_->update(graphs_[0], batchWords/averageBatchWords);
+      } else {
+        opt_->update(graphs_[0]);
+      }
+    } else {
+      // add instead of copy?
+      std::vector<std::thread> threads;
+      int pos = 0;
+      for(int idx = 0; idx < devices_.size(); idx++) {
+        threads.emplace_back(std::thread(
+            [=](int idx, int pos) {
+              // individual mutex per-shard
+              std::lock_guard<std::mutex> guard(shardSync_[idx]);
+
+              // send shard
+              quantizedGrads_[idx]->copyFrom(newGrads->subtensor(pos, grads_[idx]->size()));
+
+              // convert back to dense, with index offset of -pos
+              quantizedGrads_[idx]->decode(grads_[idx], -pos);
+
+              // apply and increment your version number
+              int pastVersion = globalVersionNumber[idx] % historySize_;
+              int latestVersion = ++globalVersionNumber[idx] % historySize_;
+              params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
+              
+              if (scaleLR) {
+                shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx], batchWords/averageBatchWords);
+              } else {
+                shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx]);
+              }
+
+              if(movingAvg_)
+                updateMovingAverage(paramsAvg_[idx],
+                                    params_[latestVersion][idx],
+                                    scheduler_->numberOfBatches());
+
             },
             idx,
             pos));
@@ -484,16 +620,11 @@ private:
           int __size__ = min(shardSize_, totalSize);
           totalSize -= __size__;
 
-          for(int h_id = 0; h_id < historySize_; h_id++) {
-            Tensor param;
-            Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
-            allocator->reserveExact(__size__ * sizeof(float));
-            allocator->allocate(param, {1, __size__});
-            paramsAlloc_.push_back(allocator);
-
+          for(int hId = 0; hId < historySize_; hId++) {
+            Tensor param = newTensor(__size__, device);
             param->copyFrom(
                 graphs_[0]->params()->vals()->subtensor(pos, __size__));
-            params_[h_id].push_back(param);
+            params_[hId].push_back(param);
           }
 
           if(dropRate_)
@@ -507,12 +638,7 @@ private:
         for(auto device : devices_) {
           int __size__ = min(shardSize_, totalSize);
           totalSize -= __size__;
-          Tensor grad_;
-          Ptr<TensorAllocator> allocator_ = New<TensorAllocator>(device);
-
-          allocator_->reserveExact(__size__ * sizeof(float));
-          allocator_->allocate(grad_, {1, __size__});
-          gradsAlloc_.push_back(allocator_);
+          Tensor grad_ = newTensor(__size__, device);
           grads_.push_back(grad_);
         }
       }
@@ -524,15 +650,9 @@ private:
           for(auto device : devices_) {
             int __size__ = min(shardSize_, totalSize);
             totalSize -= __size__;
-            Tensor paramAvg;
-            Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
-
-            allocator->reserveExact(__size__ * sizeof(float));
-            allocator->allocate(paramAvg, {1, __size__});
+            Tensor paramAvg = newTensor(__size__, device);
 
             paramAvg->copyFrom(params_[0][i++]);
-
-            paramsAllocAvg_.push_back(allocator);
             paramsAvg_.push_back(paramAvg);
           }
         }
@@ -540,19 +660,23 @@ private:
 
       if(dropRate_ && first_) {
         int totalSize = graphs_[0]->params()->vals()->size();
-        int sparseCapacity = totalSize * 1.2 * (1.0 - dropRate_); // why 1.2?
-        for(auto device : devices_) {
-          sparseGrads_.push_back(
-              SparseTensor(new SparseTensorBase(sparseCapacity, device)));
-          localSparseGrads_.push_back(
-              SparseTensor(new SparseTensorBase(sparseCapacity, device)));
-          tmpSparseDelta.push_back(SparseTensor(
-              new SparseTensorBase(sparseCapacity / devices_.size(), device)));
-          std::vector<SparseTensor> tmp;
-          for(int i = 0; i < devices_.size(); i++)
-            tmp.push_back(SparseTensor(
+        int sparseCapacity = totalSize * 1.2 * (1.0 - dropRate_);
+        if (quantizationVariant_ == QUANTIZATION_SIMULATED) {
+          for(auto device : devices_) {
+            sparseGrads_.push_back(
+                SparseTensor(new SparseTensorBase(sparseCapacity, device)));
+            localSparseGrads_.push_back(
+                SparseTensor(new SparseTensorBase(sparseCapacity, device)));
+            tmpSparseDelta.push_back(SparseTensor(
                 new SparseTensorBase(sparseCapacity / devices_.size(), device)));
-          localSparseDelta.push_back(tmp);
+            std::vector<SparseTensor> tmp;
+            for(int i = 0; i < devices_.size(); i++)
+              tmp.push_back(SparseTensor(
+                  new SparseTensorBase(sparseCapacity / devices_.size(), device)));
+            localSparseDelta.push_back(tmp);
+          }
+        } else {
+          initQuantizedVars(sparseCapacity);
         }
       }
 
@@ -584,17 +708,23 @@ private:
 
         for (auto& x: graph->params()->getMap()) {
           layerShapes.push_back({x.second->shape()[0], x.second->shape()[1]});
-          if (myId == 0)
-            LOG(info)->info("Layer size {} {}", x.second->shape()[0], x.second->shape()[1]);
         }
       }
 
       if(!dropper) {
         std::lock_guard<std::mutex> lock(sync_);
-        dropper = GradientDrop(new GradientDropBase(options_));
+        dropper = GradientDrop(new GradientDropBase(
+            options_->get<int>("quantize-bits"),
+            options_->get<bool>("quantize-min-drop"),
+            options_->get<bool>("quantize-column-wise")
+        ));
         std::vector<GradientDrop> tmp;
         for(int i = 0; i < devices_.size(); i++)
-          tmp.push_back(GradientDrop(new GradientDropBase(options_)));
+          tmp.push_back(GradientDrop(new GradientDropBase(
+              options_->get<int>("quantize-bits"),
+              options_->get<bool>("quantize-min-drop"),
+              options_->get<bool>("quantize-column-wise")
+          )));
         fetchDropper.push_back(tmp);
       }
 
@@ -603,7 +733,10 @@ private:
       if(t % tau_ == 0) {
 
         if(dropRate_ && t > 0)
-          sparseFetchParams(graph->params()->vals(), myId);
+          if(quantizationVariant_ == QUANTIZATION_SIMULATED)
+            sparseFetchParams(graph->params()->vals(), myId);
+          else
+            quantizedFetchParams(graph->params()->vals(), myId);
         else
           fetchParams(graph->params()->vals(),
                       params_[globalVersionNumber[myId] % historySize_]);
@@ -638,12 +771,15 @@ private:
       t++;
 
       if(t % tau_ == 0) {
-
-        cudaStreamSynchronize(0);
         if(dropRate_) {
-          dropper->dropGraph(
-              graph->params()->grads(), localSparseGrads_[myId], dropRate_, layerShapes);
-          sparsePushGradients(localSparseGrads_[myId], numSeenWords);
+          if(quantizationVariant_ == QUANTIZATION_SIMULATED) {
+            dropper->dropGraph(
+                graph->params()->grads(), localSparseGrads_[myId], dropRate_, layerShapes);
+            sparsePushGradients(localSparseGrads_[myId], numSeenWords);
+          } else {
+            localQuantizedGrads_[myId]->encode(graph->params()->grads());
+            quantizedPushGradients(localQuantizedGrads_[myId], numSeenWords);
+          }
         } else {
           pushGradients(graph->params()->grads(), numSeenWords);
         }
@@ -681,7 +817,7 @@ private:
           if(injectFreq && scheduler_->numberOfBatches() % injectFreq == 0) {
             boost::upgrade_to_unique_lock<boost::shared_mutex> uniqueLock(lock);
 
-            LOG(info)->info("{} : Injecting moving average into training parameters",
+            // LOG(info)->info("{} : Injecting moving average into training parameters",
                             scheduler_->numberOfBatches());
             for(int idx = 0; idx < paramsAvg_.size(); idx++) {
               std::lock_guard<std::mutex> guard(shardSync_[idx]);
@@ -705,9 +841,10 @@ public:
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
         dropRate_{options_->get<double>("drop-rate")},
-        tau_{options_->get<size_t>("tau")} {
+        tau_{options_->get<size_t>("tau")},
+        quantizationVariant_{options_->get<int>("quantize-variant")} {
     if(dropRate_ > 0.0) {
-      historySize_ = devices_.size() * 1.5;
+      historySize_ = 1.5 * devices_.size();
     }
     for(int i = 0; i < historySize_; i++)
       params_.push_back(std::vector<Tensor>());
